@@ -8,6 +8,7 @@ import json
 import os
 import time
 import logging
+import hashlib
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -59,11 +60,19 @@ def classify_sentiment(compound: float) -> str:
     return "neutral"
 
 
+def stable_article_id(url: str) -> str:
+    """
+    Generate a stable, consistent article ID using MD5 hash of URL.
+    Unlike Python's built-in hash(), this is consistent across restarts.
+    """
+    return hashlib.md5(url.encode("utf-8")).hexdigest()
+
+
 def fetch_articles(query: str, from_dt: datetime) -> list[dict]:
     """Call NewsAPI and return raw articles for a query."""
     params = {
         "q":        query,
-        "from":     from_dt.strftime("%Y-%m-%d"),  # Date only, no time (API limitation)
+        "from":     from_dt.strftime("%Y-%m-%d"),
         "sortBy":   "publishedAt",
         "language": "en",
         "pageSize": 20,
@@ -76,13 +85,13 @@ def fetch_articles(query: str, from_dt: datetime) -> list[dict]:
         articles = data.get("articles", [])
         logger.debug(f"NewsAPI query '{query}': got {len(articles)} articles")
         if data.get("status") != "ok":
-            logger.warning(f"NewsAPI status not OK: {data.get('status')} - {data.get('message', 'unknown error')}")
+            logger.warning(f"NewsAPI status not OK: {data.get('message', 'unknown error')}")
         return articles
     except requests.exceptions.HTTPError as e:
         if response.status_code == 401:
-            logger.error(f"NewsAPI 401 Unauthorized: Invalid or expired API key")
+            logger.error("NewsAPI 401 Unauthorized: Invalid or expired API key")
         elif response.status_code == 429:
-            logger.error(f"NewsAPI 429 Too Many Requests: Rate limited")
+            logger.error("NewsAPI 429 Too Many Requests: Rate limited")
         else:
             logger.error(f"NewsAPI HTTP error {response.status_code}: {response.text}")
         return []
@@ -92,15 +101,16 @@ def fetch_articles(query: str, from_dt: datetime) -> list[dict]:
 
 
 def build_record(article: dict, query: str, scores: dict) -> dict:
-    text = f"{article.get('title', '')} {article.get('description', '')}"
+    url = article.get("url", "")
     return {
-        "article_id":         hash(article.get("url", "")),
+        # Stable ID using MD5 — consistent across container restarts
+        "article_id":         stable_article_id(url),
         "query":              query,
         "source":             article.get("source", {}).get("name", "unknown"),
         "author":             article.get("author", ""),
         "title":              article.get("title", ""),
         "description":        article.get("description", ""),
-        "url":                article.get("url", ""),
+        "url":                url,
         "published_at":       article.get("publishedAt", ""),
         "ingested_at":        datetime.now(timezone.utc).isoformat(),
         "sentiment_pos":      round(scores["pos"], 4),
@@ -115,8 +125,8 @@ def build_record(article: dict, query: str, scores: dict) -> dict:
 class NewsProducer:
     def __init__(self):
         max_retries = 5
-        retry_delay = 5  # seconds
-        
+        retry_delay = 5
+
         for attempt in range(max_retries):
             try:
                 self.producer = create_producer()
@@ -129,17 +139,14 @@ class NewsProducer:
                 else:
                     logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
                     raise
-        
+
         self.analyzer = SentimentIntensityAnalyzer()
         self.seen_urls = set()
 
     def fetch_and_publish(self):
-        # Look back 24 hours instead of 20 minutes
-        # NewsAPI free tier has a delay - articles appear 6-24 hours after publishing
         from_dt = datetime.now(timezone.utc) - timedelta(hours=24)
         total = 0
-        
-        logger.info(f"API Key present: {bool(NEWS_API_KEY)}")
+
         if not NEWS_API_KEY:
             logger.error("NEWS_API_KEY is not set!")
             return
@@ -147,7 +154,7 @@ class NewsProducer:
         for query in NEWS_QUERIES:
             articles = fetch_articles(query, from_dt)
             logger.info(f"Query '{query}': {len(articles)} articles found")
-            
+
             for article in articles:
                 url = article.get("url", "")
                 if url in self.seen_urls:
@@ -165,7 +172,6 @@ class NewsProducer:
                 self.seen_urls.add(url)
                 total += 1
 
-        # Keep memory bounded
         if len(self.seen_urls) > 10000:
             self.seen_urls = set(list(self.seen_urls)[-10000:])
 

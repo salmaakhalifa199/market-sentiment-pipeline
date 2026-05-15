@@ -1,4 +1,14 @@
+x-base: &base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+
 services:
+
+  # ─────────────────────────────────────────
+  # KAFKA LAYER
+  # ─────────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
@@ -13,11 +23,13 @@ services:
     container_name: kafka
     depends_on:
       - zookeeper
+    restart: unless-stopped
     ports:
       - "9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
@@ -43,24 +55,119 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command: |
       "
-      echo 'Waiting for Kafka to be ready...'
       sleep 15
-      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic crypto.prices --partitions 3 --replication-factor 1
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic crypto.prices    --partitions 3 --replication-factor 1
       kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic market.sentiment --partitions 3 --replication-factor 1
-      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic market.news --partitions 3 --replication-factor 1
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic market.news      --partitions 3 --replication-factor 1
       echo 'Topics created.'
       "
 
-  producers:
-    build: ./producers
-    container_name: producers
+  # ─────────────────────────────────────────
+  # PRODUCERS
+  # ─────────────────────────────────────────
+  binance-producer:
+    <<: *base
+    container_name: binance-producer
     depends_on:
       - kafka
-    env_file:
-      - .env
+    env_file: .env
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-    restart: unless-stopped
+    command: ["python", "producers/binance_producer.py"]
+
+  stocktwits-producer:
+    <<: *base
+    container_name: stocktwits-producer
+    depends_on:
+      - kafka
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    command: ["python", "producers/stocktwits_producer.py"]
+
+  news-producer:
+    <<: *base
+    container_name: news-producer
+    depends_on:
+      - kafka
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    command: ["python", "producers/news_producer.py"]
+
+  # ─────────────────────────────────────────
+  # SPARK LAYER
+  # ─────────────────────────────────────────
+  spark-master:
+    <<: *base
+    container_name: spark-master
+    ports:
+      - "8082:8080"   # Spark Master UI
+      - "7077:7077"
+    environment:
+      - SPARK_MODE=master
+      - SPARK_HOME=/opt/spark
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    command: >
+      /bin/bash -c "
+      /opt/spark/sbin/start-master.sh --host 0.0.0.0 --port 7077 --webui-port 8080 &&
+      tail -f /opt/spark/logs/*.out
+      "
+    volumes:
+      - delta-data:/delta
+
+  spark-worker:
+    <<: *base
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+      - SPARK_HOME=/opt/spark
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    command: >
+      /bin/bash -c "
+      /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
+      tail -f /opt/spark/logs/*.out
+      "
+    volumes:
+      - delta-data:/delta
+
+  stream-prices:
+    <<: *base
+    container_name: stream-prices
+    depends_on:
+      - spark-master
+      - kafka
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages io.delta:delta-core_2.12:2.1.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      /app/spark/stream_prices.py
+    volumes:
+      - .:/app
+      - delta-data:/delta
+
+  stream-sentiment:
+    <<: *base
+    container_name: stream-sentiment
+    depends_on:
+      - spark-master
+      - kafka
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages io.delta:delta-core_2.12:2.1.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      /app/spark/stream_sentiment.py
+    volumes:
+      - .:/app
+      - delta-data:/delta
 
 volumes:
-  kafka-data:
+  delta-data:
