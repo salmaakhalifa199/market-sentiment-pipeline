@@ -1,0 +1,47 @@
+version: 2
+
+models:
+  - name: stg_crypto_prices
+    description: "Cleaned crypto price ticks from Binance WebSocket via Delta Lake Silver"
+    columns:
+      - name: symbol
+        description: "Trading pair symbol e.g. BTCUSDT"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+      - name: price
+        description: "Current price in USD"
+        tests:
+          - not_null
+      - name: price_direction
+        tests:
+          - accepted_values:
+              values: ['bullish', 'bearish', 'neutral']
+
+  - name: stg_sentiment
+    description: "Stocktwits messages with VADER + user-label sentiment"
+    columns:
+      - name: message_id
+        tests:
+          - not_null
+          - unique
+      - name: final_sentiment
+        tests:
+          - accepted_values:
+              values: ['bullish', 'bearish', 'neutral']
+      - name: influence_score
+        tests:
+          - not_null
+
+  - name: stg_news
+    description: "Financial news articles with sentiment scores"
+    columns:
+      - name: article_id
+        tests:
+          - not_null
+          - unique
+      - name: sentiment_strength
+        tests:
+          - accepted_values:
+              values: ['strong_positive', 'mild_positive', 'neutral', 'mild_negative', 'strong_negative']

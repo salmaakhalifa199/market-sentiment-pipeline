@@ -1,0 +1,24 @@
+name: market_sentiment
+version: "1.0.0"
+config-version: 2
+
+profile: market_sentiment
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  market_sentiment:
+    staging:
+      +materialized: view        # lightweight — just clean raw data
+      +schema: staging
+    marts:
+      +materialized: table       # heavier — aggregated analytics
+      +schema: marts
+    gold:
+      +materialized: table       # final Gold layer for dashboards
+      +schema: gold
