@@ -5,10 +5,11 @@ x-base: &base
   restart: unless-stopped
   volumes:
     - .:/app
-    - ./spark/delta:/delta   # bind mount: visible in VS Code
+    - ./spark/delta:/delta
 
 services:
 
+  # ── KAFKA ──────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
@@ -92,7 +93,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     command: ["python", "/app/producers/news_producer.py"]
 
-  # ── SPARK ──────────────────────────────────
+  # ── SPARK MASTER ───────────────────────────
   spark-master:
     <<: *base
     container_name: spark-master
@@ -112,30 +113,61 @@ services:
       - --webui-port
       - "8080"
 
-  spark-worker:
+  # ── WORKER 1: for stream-prices ────────────
+  spark-worker-1:
     <<: *base
-    container_name: spark-worker
-    hostname: spark-worker
+    container_name: spark-worker-1
+    hostname: spark-worker-1
     depends_on:
       - spark-master
     environment:
       SPARK_NO_DAEMONIZE: "true"
-      SPARK_WORKER_MEMORY: 2g
-      SPARK_WORKER_CORES: "4"
+      SPARK_WORKER_MEMORY: 1500m
+      SPARK_WORKER_CORES: "2"
+      # Label this worker for prices job
+      SPARK_WORKER_OPTS: "-Dspark.worker.resource.gpu.amount=0"
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.worker.Worker
       - --webui-port
-      - "8081"
+      - "8083"
+      - --cores
+      - "2"
+      - --memory
+      - "1500m"
       - spark://spark-master:7077
 
+  # ── WORKER 2: for stream-sentiment ─────────
+  spark-worker-2:
+    <<: *base
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_MEMORY: 1500m
+      SPARK_WORKER_CORES: "2"
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8084"
+      - --cores
+      - "2"
+      - --memory
+      - "1500m"
+      - spark://spark-master:7077
+
+  # ── STREAM PRICES ───────────────────────────
+  # Uses exactly 1 core + 1g so worker-2 still has resources for sentiment
   stream-prices:
     <<: *base
     container_name: stream-prices
     hostname: stream-prices
     depends_on:
-      - spark-master
-      - spark-worker
+      - spark-worker-1
+      - spark-worker-2
       - kafka
     ports:
       - "4040:4040"
@@ -143,12 +175,14 @@ services:
       - /bin/bash
       - -c
       - |
-        echo "Waiting 30s for Spark master..."
         sleep 30
-        echo "Submitting stream-prices..."
+        echo "Starting stream-prices..."
         /opt/spark/bin/spark-submit \
           --master spark://spark-master:7077 \
           --deploy-mode client \
+          --total-executor-cores 1 \
+          --executor-memory 700m \
+          --driver-memory 700m \
           --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
           --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
           --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
@@ -157,13 +191,15 @@ services:
           --conf spark.jars.ivy=/tmp/.ivy \
           /app/spark/stream_prices.py 2>&1
 
+  # ── STREAM SENTIMENT ────────────────────────
+  # Starts 10s after prices to avoid racing for same executor slot
   stream-sentiment:
     <<: *base
     container_name: stream-sentiment
     hostname: stream-sentiment
     depends_on:
-      - spark-master
-      - spark-worker
+      - spark-worker-1
+      - spark-worker-2
       - kafka
     ports:
       - "4041:4040"
@@ -171,12 +207,14 @@ services:
       - /bin/bash
       - -c
       - |
-        echo "Waiting 35s for Spark master..."
-        sleep 35
-        echo "Submitting stream-sentiment..."
+        sleep 45
+        echo "Starting stream-sentiment..."
         /opt/spark/bin/spark-submit \
           --master spark://spark-master:7077 \
           --deploy-mode client \
+          --total-executor-cores 1 \
+          --executor-memory 700m \
+          --driver-memory 700m \
           --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
           --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
           --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
@@ -185,3 +223,23 @@ services:
           --conf spark.jars.ivy=/tmp/.ivy \
           /app/spark/stream_sentiment.py 2>&1
 
+  # ── DBT ────────────────────────────────────
+  dbt:
+    <<: *base
+    container_name: dbt
+    depends_on:
+      - spark-master
+    environment:
+      DBT_PROFILES_DIR: /app/dbt
+    command:
+      - /bin/bash
+      - -c
+      - |
+        pip install dbt-spark[PyHive]==1.7.0 --quiet
+        sleep 60
+        cd /app/dbt
+        dbt deps
+        dbt run --profiles-dir /app/dbt
+        dbt test --profiles-dir /app/dbt
+        echo "dbt complete."
+        sleep infinity

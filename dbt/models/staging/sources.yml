@@ -1,0 +1,12 @@
+version: 2
+
+sources:
+  - name: delta_silver
+    description: "Delta Lake Silver layer — cleaned streaming data"
+    tables:
+      - name: crypto_prices
+        description: "Cleaned Binance price ticks"
+      - name: sentiment
+        description: "Cleaned Stocktwits messages with sentiment scores"
+      - name: news
+        description: "Cleaned NewsAPI articles with sentiment scores"

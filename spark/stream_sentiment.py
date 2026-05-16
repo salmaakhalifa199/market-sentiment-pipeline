@@ -6,7 +6,7 @@ Writes: Delta Lake Bronze + Silver layers
 
 import sys
 import traceback
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
     col, from_json, to_timestamp, current_timestamp,
     when, round as spark_round, lit
@@ -68,7 +68,7 @@ NEWS_SCHEMA = StructType([
 
 
 def create_spark_session():
-    print("DEBUG: Creating SparkSession for sentiment stream...")
+    print("DEBUG: Creating SparkSession...")
     spark = (
         SparkSession.builder
         .appName("SentimentStream")
@@ -84,7 +84,7 @@ def create_spark_session():
 
 
 def read_kafka(spark, topic):
-    print(f"DEBUG: Subscribing to Kafka topic: {topic}")
+    print(f"DEBUG: Subscribing to {topic}")
     return (
         spark.readStream
         .format("kafka")
@@ -119,7 +119,8 @@ def parse_news(raw_df):
     )
 
 
-def enrich_stocktwits_silver(df):
+def enrich_stocktwits_silver(df: DataFrame) -> DataFrame:
+    """Enrich parsed Stocktwits data for Silver layer."""
     return (
         df
         .filter(col("message_id").isNotNull())
@@ -130,10 +131,13 @@ def enrich_stocktwits_silver(df):
             .otherwise(lit(0.0))
         )
         .withColumn("combined_sentiment_score",
-            spark_round(col("sentiment_compound") * 0.4 + col("user_label_score") * 0.6, 4)
+            spark_round(
+                col("sentiment_compound") * 0.4 + col("user_label_score") * 0.6,
+                4
+            )
         )
         .withColumn("final_sentiment",
-            when(col("combined_sentiment_score") > 0.1,  lit("bullish"))
+            when(col("combined_sentiment_score") > 0.1,   lit("bullish"))
             .when(col("combined_sentiment_score") < -0.1, lit("bearish"))
             .otherwise(lit("neutral"))
         )
@@ -143,63 +147,105 @@ def enrich_stocktwits_silver(df):
                 .when(col("user_followers") > 1000,  lit(0.7))
                 .when(col("user_followers") > 100,   lit(0.4))
                 .otherwise(lit(0.1)),
-            2)
+                2
+            )
         )
     )
 
 
-def enrich_news_silver(df):
+def enrich_news_silver(df: DataFrame) -> DataFrame:
+    """Enrich parsed News data for Silver layer."""
     return (
         df
         .filter(col("article_id").isNotNull())
         .filter(col("title").isNotNull())
         .withColumn("sentiment_strength",
-            when(col("sentiment_compound") >= 0.5,  lit("strong_positive"))
+            when(col("sentiment_compound") >= 0.5,   lit("strong_positive"))
             .when(col("sentiment_compound") >= 0.05, lit("mild_positive"))
             .when(col("sentiment_compound") <= -0.5, lit("strong_negative"))
             .when(col("sentiment_compound") <= -0.05, lit("mild_negative"))
             .otherwise(lit("neutral"))
         )
         .withColumn("is_high_impact",
-            when((col("sentiment_compound") >= 0.5) | (col("sentiment_compound") <= -0.5), lit(True))
-            .otherwise(lit(False))
+            when(
+                (col("sentiment_compound") >= 0.5) | (col("sentiment_compound") <= -0.5),
+                lit(True)
+            ).otherwise(lit(False))
         )
     )
 
 
-def debug_batch(df, epoch_id, label):
-    count = df.count()
-    print(f"DEBUG: [{label}] Batch {epoch_id} — {count} records")
-    if count > 0:
-        df.show(2, truncate=True)
+def make_sentiment_writer(parsed_df):
+    """Write Stocktwits data to Bronze and Silver separately."""
 
+    def write_batch(batch_df: DataFrame, epoch_id: int):
+        count = batch_df.count()
+        print(f"DEBUG: [SENTIMENT] Batch {epoch_id} — {count} records")
 
-def make_writer(df, bronze_path, silver_path, checkpoint_prefix, enrich_fn, partition_col=None):
-    """Create bronze + silver writeStream for a given parsed DataFrame."""
+        if count == 0:
+            return
 
-    def write_both(batch_df, epoch_id):
-        # Bronze: raw
-        debug_batch(batch_df, epoch_id, f"BRONZE/{checkpoint_prefix}")
-        (batch_df.write.format("delta")
+        # Bronze: raw parsed data
+        (batch_df.write
+            .format("delta")
             .mode("append")
             .option("mergeSchema", "true")
-            .save(bronze_path))
+            .save(BRONZE_SENTIMENT))
+        print(f"DEBUG: [BRONZE/sentiment] Written {count} records")
 
         # Silver: enriched
-        silver_df = enrich_fn(batch_df)
-        debug_batch(silver_df, epoch_id, f"SILVER/{checkpoint_prefix}")
-        writer = (silver_df.write.format("delta")
-                    .mode("append")
-                    .option("mergeSchema", "true"))
-        if partition_col:
-            writer = writer.partitionBy(partition_col)
-        writer.save(silver_path)
+        silver_df = enrich_stocktwits_silver(batch_df)
+        silver_count = silver_df.count()
+        (silver_df.write
+            .format("delta")
+            .mode("append")
+            .option("mergeSchema", "true")
+            .partitionBy("symbol")
+            .save(SILVER_SENTIMENT))
+        print(f"DEBUG: [SILVER/sentiment] Written {silver_count} records")
 
     return (
-        df.writeStream
-        .foreachBatch(write_both)
-        .option("checkpointLocation", f"{CHECKPOINT_BASE}/{checkpoint_prefix}")
-        .trigger(processingTime="10 seconds")
+        parsed_df.writeStream
+        .foreachBatch(write_batch)
+        .option("checkpointLocation", f"{CHECKPOINT_BASE}/sentiment")
+        .trigger(processingTime="15 seconds")
+        .start()
+    )
+
+
+def make_news_writer(parsed_df):
+    """Write News data to Bronze and Silver separately."""
+
+    def write_batch(batch_df: DataFrame, epoch_id: int):
+        count = batch_df.count()
+        print(f"DEBUG: [NEWS] Batch {epoch_id} — {count} records")
+
+        if count == 0:
+            return
+
+        # Bronze: raw parsed data
+        (batch_df.write
+            .format("delta")
+            .mode("append")
+            .option("mergeSchema", "true")
+            .save(BRONZE_NEWS))
+        print(f"DEBUG: [BRONZE/news] Written {count} records")
+
+        # Silver: enriched
+        silver_df = enrich_news_silver(batch_df)
+        silver_count = silver_df.count()
+        (silver_df.write
+            .format("delta")
+            .mode("append")
+            .option("mergeSchema", "true")
+            .save(SILVER_NEWS))
+        print(f"DEBUG: [SILVER/news] Written {silver_count} records")
+
+    return (
+        parsed_df.writeStream
+        .foreachBatch(write_batch)
+        .option("checkpointLocation", f"{CHECKPOINT_BASE}/news")
+        .trigger(processingTime="15 seconds")
         .start()
     )
 
@@ -215,27 +261,19 @@ if __name__ == "__main__":
         # Stocktwits stream
         raw_sentiment    = read_kafka(spark, SENTIMENT_TOPIC)
         parsed_sentiment = parse_stocktwits(raw_sentiment)
-        q_sentiment = make_writer(
-            parsed_sentiment,
-            BRONZE_SENTIMENT, SILVER_SENTIMENT,
-            "sentiment", enrich_stocktwits_silver, "symbol"
-        )
-        print(f"DEBUG: Sentiment stream started → {BRONZE_SENTIMENT}")
+        q_sentiment      = make_sentiment_writer(parsed_sentiment)
+        print(f"DEBUG: Sentiment stream started")
 
         # News stream
         raw_news    = read_kafka(spark, NEWS_TOPIC)
         parsed_news = parse_news(raw_news)
-        q_news = make_writer(
-            parsed_news,
-            BRONZE_NEWS, SILVER_NEWS,
-            "news", enrich_news_silver
-        )
-        print(f"DEBUG: News stream started → {BRONZE_NEWS}")
+        q_news      = make_news_writer(parsed_news)
+        print(f"DEBUG: News stream started")
 
         print("DEBUG: Awaiting termination...")
         spark.streams.awaitAnyTermination()
 
     except Exception as e:
-        print(f"FATAL ERROR in stream_sentiment.py: {e}")
+        print(f"FATAL ERROR: {e}")
         traceback.print_exc()
         sys.exit(1)

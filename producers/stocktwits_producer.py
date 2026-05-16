@@ -1,8 +1,6 @@
 """
 Stocktwits Producer
 Fetches streams for crypto & stock symbols → Kafka topic: market.sentiment
-Stocktwits users self-label posts as bullish/bearish — ground truth sentiment.
-API Docs: https://api.stocktwits.com/developers/docs
 No API key required for public streams.
 """
 
@@ -27,16 +25,15 @@ logger = logging.getLogger("stocktwits_producer")
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TOPIC = "market.sentiment"
-POLL_INTERVAL_SEC = 120  # every 2 minutes
+POLL_INTERVAL_SEC = 120
 
-# Stocktwits uses $ prefix for symbols
 SYMBOLS = [
-    "BTC.X",   # Bitcoin
-    "ETH.X",   # Ethereum
-    "SOL.X",   # Solana
-    "AAPL",    # Apple
-    "TSLA",    # Tesla
-    "NVDA",    # Nvidia
+    "BTC.X",
+    "ETH.X",
+    "SOL.X",
+    "AAPL",
+    "TSLA",
+    "NVDA",
 ]
 
 BASE_URL = "https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
@@ -61,23 +58,35 @@ def classify_vader(compound: float) -> str:
 
 
 def fetch_symbol_stream(symbol: str) -> list[dict]:
-    """Fetch latest 30 messages for a symbol from Stocktwits."""
     url = BASE_URL.format(symbol=symbol)
     try:
-        response = requests.get(url, timeout=10, headers={"User-Agent": "market-sentiment-pipeline/1.0"})
+        response = requests.get(
+            url,
+            timeout=15,
+            headers={"User-Agent": "market-sentiment-pipeline/1.0"}
+        )
+        logger.info(f"Stocktwits [{symbol}] status: {response.status_code}")
+
         if response.status_code == 429:
             logger.warning(f"Rate limited for {symbol}. Waiting 60s...")
             time.sleep(60)
             return []
+        if response.status_code == 404:
+            logger.warning(f"Symbol {symbol} not found on Stocktwits")
+            return []
+
         response.raise_for_status()
-        return response.json().get("messages", [])
+        data = response.json()
+        messages = data.get("messages", [])
+        logger.info(f"Stocktwits [{symbol}]: got {len(messages)} messages")
+        return messages
+
     except requests.RequestException as e:
         logger.error(f"Stocktwits API error for {symbol}: {e}")
         return []
 
 
 def extract_entities(entities: dict) -> dict:
-    """Extract mentioned symbols and sentiment from entities block."""
     symbols_mentioned = [
         s.get("symbol", "") for s in entities.get("symbols", [])
     ]
@@ -85,58 +94,50 @@ def extract_entities(entities: dict) -> dict:
 
 
 def build_record(message: dict, symbol: str, vader_scores: dict) -> dict:
-    """
-    Build a clean Kafka record from a Stocktwits message.
-    Key advantage: user_sentiment is GROUND TRUTH (self-labeled by trader).
-    """
     user = message.get("user", {})
-    # Stocktwits sentiment: {"basic": "Bullish"} or {"basic": "Bearish"} or None
     raw_sentiment = message.get("entities", {}).get("sentiment", None)
     user_sentiment = raw_sentiment.get("basic", "neutral").lower() if raw_sentiment else "neutral"
-
     entities = message.get("entities", {})
 
     return {
-        # Identifiers
-        "message_id":           message.get("id"),
+        "message_id":           str(message.get("id", "")),
         "symbol":               symbol,
-
-        # Content
         "body":                 message.get("body", ""),
         "created_at":           message.get("created_at", ""),
         "ingested_at":          datetime.now(timezone.utc).isoformat(),
-
-        # User info
-        "user_id":              user.get("id"),
+        "user_id":              str(user.get("id", "")),
         "username":             user.get("username", ""),
-        "user_followers":       user.get("followers", 0),
-        "user_following":       user.get("following", 0),
-        "user_ideas":           user.get("ideas", 0),       # total posts = experience signal
-        "user_watchlist_count": user.get("watchlist_stocks_count", 0),
-
-        # Ground truth sentiment (self-labeled by trader) ← KEY SIGNAL
-        "user_sentiment":       user_sentiment,             # bullish | bearish | neutral
-
-        # VADER NLP sentiment on message body (second signal)
+        "user_followers":       int(user.get("followers", 0)),
+        "user_following":       int(user.get("following", 0)),
+        "user_ideas":           int(user.get("ideas", 0)),
+        "user_watchlist_count": int(user.get("watchlist_stocks_count", 0)),
+        "user_sentiment":       user_sentiment,
         "sentiment_pos":        round(vader_scores["pos"], 4),
         "sentiment_neg":        round(vader_scores["neg"], 4),
         "sentiment_neu":        round(vader_scores["neu"], 4),
         "sentiment_compound":   round(vader_scores["compound"], 4),
         "sentiment_label":      classify_vader(vader_scores["compound"]),
-
-        # Sentiment agreement signal
         "sentiment_agreement":  user_sentiment == classify_vader(vader_scores["compound"]).replace("positive", "bullish").replace("negative", "bearish"),
-
-        # Other mentioned symbols
-        **extract_entities(entities),
-
+        "symbols_mentioned":    extract_entities(entities)["symbols_mentioned"],
         "data_source":          "stocktwits",
     }
 
 
 class StocktwitsProducer:
     def __init__(self):
-        self.producer = create_producer()
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                self.producer = create_producer()
+                logger.info("✓ Kafka connection established")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Kafka not ready, retrying in 5s... ({e})")
+                    time.sleep(5)
+                else:
+                    raise
+
         self.analyzer = SentimentIntensityAnalyzer()
         self.seen_ids = set()
 
@@ -145,7 +146,7 @@ class StocktwitsProducer:
         for symbol in SYMBOLS:
             messages = fetch_symbol_stream(symbol)
             for message in messages:
-                msg_id = message.get("id")
+                msg_id = str(message.get("id", ""))
                 if msg_id in self.seen_ids:
                     continue
 
@@ -161,16 +162,16 @@ class StocktwitsProducer:
                 self.seen_ids.add(msg_id)
                 total += 1
 
-            time.sleep(2)  # gentle rate limiting between symbols
+            time.sleep(3)  # gentle rate limiting between symbols
 
-        # Keep memory bounded
         if len(self.seen_ids) > 10000:
             self.seen_ids = set(list(self.seen_ids)[-10000:])
 
         logger.info(f"Published {total} new messages → {KAFKA_TOPIC}")
+        self.producer.flush()
 
     def run(self):
-        logger.info(f"Starting Stocktwits producer. Polling every {POLL_INTERVAL_SEC // 60} minutes...")
+        logger.info(f"Starting Stocktwits producer. Polling every {POLL_INTERVAL_SEC}s...")
         while True:
             try:
                 self.fetch_and_publish()

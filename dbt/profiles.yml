@@ -1,0 +1,13 @@
+market_sentiment:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: thrift
+      host: spark-master
+      port: 10000
+      user: root
+      schema: default
+      threads: 4
+      connect_retries: 5
+      connect_timeout: 60
